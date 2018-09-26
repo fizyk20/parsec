@@ -47,6 +47,8 @@ pub struct Parsec<T: NetworkEvent, S: SecretId> {
     events: BTreeMap<Hash, Event<T, S::PublicId>>,
     // The sequence in which all gossip events were added to this `Parsec`.
     events_order: Vec<Hash>,
+    start: usize,
+    current: usize,
     // The hashes of events for each peer that have a non-empty set of `interesting_content`
     interesting_events: BTreeMap<S::PublicId, VecDeque<Hash>>,
     // Consensused network events that have not been returned via `poll()` yet.
@@ -174,6 +176,8 @@ impl<T: NetworkEvent, S: SecretId> Parsec<T, S> {
             peer_list: PeerList::new(our_id),
             events: BTreeMap::new(),
             events_order: vec![],
+            start: 0,
+            current: 0,
             interesting_events: BTreeMap::new(),
             consensused_blocks: VecDeque::new(),
             consensus_history: vec![],
@@ -413,6 +417,7 @@ impl<T: NetworkEvent, S: SecretId> Parsec<T, S> {
         for packed_event in packed_events {
             if let Some(event) = Event::unpack(packed_event, &self.events, &self.peer_list)? {
                 self.add_event(event)?;
+                self.process_events()?;
             }
         }
         Ok(())
@@ -421,7 +426,6 @@ impl<T: NetworkEvent, S: SecretId> Parsec<T, S> {
     fn add_event(&mut self, event: Event<T, S::PublicId>) -> Result<(), Error> {
         self.peer_list.add_event(&event)?;
         let event_hash = *event.hash();
-        let is_initial = event.is_initial();
 
         if !self.peer_list.our_state().contains(PeerState::VOTE)
             && event.creator() != self.our_pub_id()
@@ -440,54 +444,62 @@ impl<T: NetworkEvent, S: SecretId> Parsec<T, S> {
                         .unwrap_or(false)
                 }).count();
             self.events_order.insert(index, event_hash);
+            self.current = index;
         } else {
             self.events_order.push(event_hash);
         }
 
         let _ = self.events.insert(event_hash, event);
 
-        if is_initial {
-            return Ok(());
-        }
-
-        self.set_interesting_content(&event_hash)?;
-        self.process_event(&event_hash)?;
         self.handle_malice(&event_hash)?;
 
         Ok(())
     }
 
-    fn process_event(&mut self, event_hash: &Hash) -> Result<(), Error> {
+    fn process_event(&mut self, event_hash: &Hash) -> Result<Option<Block<T, S::PublicId>>, Error> {
+        if self.get_known_event(event_hash)?.is_initial() {
+            return Ok(None);
+        }
+        self.set_interesting_content(event_hash)?;
         self.set_observations(event_hash)?;
         self.set_meta_votes(event_hash)?;
         self.update_round_hashes(event_hash);
 
-        if let Some(block) = self.next_stable_block(event_hash) {
-            dump_graph::to_file(
-                self.our_pub_id(),
-                &self.events,
-                &self.meta_votes,
-                &self.peer_list,
-            );
-            self.clear_consensus_data();
-            let payload_hash = Hash::from(serialise(block.payload()).as_slice());
-            info!(
-                "{:?} got consensus on block {} with payload {:?} and payload hash {:?}",
-                self.our_pub_id(),
-                self.consensus_history.len(),
-                block.payload(),
-                payload_hash
-            );
+        Ok(self.next_stable_block(event_hash))
+    }
 
-            self.consensus_history.push(payload_hash);
-            let observation = block.payload().clone();
-            self.consensused_blocks.push_back(block);
+    fn process_events(&mut self) -> Result<(), Error> {
+        while self.current < self.events_order.len() {
+            let event_hash = self.events_order[self.current];
+            if let Some(block) = self.process_event(&event_hash)? {
+                dump_graph::to_file(
+                    self.our_pub_id(),
+                    &self.events,
+                    &self.meta_votes,
+                    &self.peer_list,
+                );
+                self.clear_consensus_data();
+                let payload_hash = Hash::from(serialise(block.payload()).as_slice());
+                info!(
+                    "{:?} got consensus on block {} with payload {:?} and payload hash {:?}",
+                    self.our_pub_id(),
+                    self.consensus_history.len(),
+                    block.payload(),
+                    payload_hash
+                );
 
-            if !self.handle_consensus(observation) {
-                return Ok(());
+                self.consensus_history.push(payload_hash);
+                let observation = block.payload().clone();
+                self.consensused_blocks.push_back(block);
+
+                if !self.handle_consensus(observation) {
+                    return Ok(());
+                }
+
+                self.restart_consensus(&payload_hash);
+            } else {
+                self.current += 1;
             }
-
-            self.restart_consensus(&payload_hash);
         }
         Ok(())
     }
@@ -565,7 +577,7 @@ impl<T: NetworkEvent, S: SecretId> Parsec<T, S> {
                 }).or_insert_with(|| iter::once(*event_hash).collect());
         }
         self.get_known_event_mut(event_hash)
-            .map(|ref mut event| event.interesting_content.extend(interesting_content))
+            .map(|ref mut event| event.interesting_content = interesting_content)
     }
 
     // Any payloads which this event sees as "interesting".  If this returns a non-empty set, then
@@ -1011,11 +1023,8 @@ impl<T: NetworkEvent, S: SecretId> Parsec<T, S> {
                 let round_hash = RoundHash::new(peer_id, *latest_block_hash);
                 (peer_id.clone(), vec![round_hash])
             }).collect();
-        let events_hashes = self.events_order.to_vec();
-        for event_hash in events_hashes {
-            let _ = self.set_interesting_content(&event_hash);
-            let _ = self.process_event(&event_hash);
-        }
+        self.start = 0;
+        self.current = 0;
     }
 
     // Returns the number of peers through which there is a directed path in the gossip graph
@@ -1060,7 +1069,8 @@ impl<T: NetworkEvent, S: SecretId> Parsec<T, S> {
         } else {
             Event::new_from_response(self_parent, other_parent, &self.events, &self.peer_list)
         };
-        self.add_event(sync_event)
+        self.add_event(sync_event)?;
+        self.process_events()
     }
 
     // Returns an iterator over `self.events` which will yield all the events we think `peer_id`
