@@ -342,6 +342,7 @@ proptest! {
     #![proptest_config(ProptestConfig {
         failure_persistence: Some(Box::new(FileFailurePersistence::WithSource("regressions"))),
         cases: 5,
+        output_seeds: true,
         ..Default::default()
     })]
 
